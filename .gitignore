@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.kilo/
+
+yolo11n.pt
+*.pt
+*.onnx
+
+output/
+videos/
+
+.env
+.idea/
+.vscode/
