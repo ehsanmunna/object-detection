@@ -23,11 +23,33 @@
             margin-bottom: 20px;
         }
 
-        video {
+        .video-container {
+            position: relative;
             width: 100%;
-            max-height: 500px;
             background: #111;
+            overflow: hidden;
             border-radius: 8px;
+            line-height: 0;
+        }
+
+        video {
+            display: block;
+            width: 100%;
+            height: auto;
+            max-height: 500px;
+            object-fit: contain;
+        }
+
+        #overlayCanvas {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+
+        #captureCanvas {
+            display: none;
         }
 
         button {
@@ -62,30 +84,66 @@
             font-size: 14px;
         }
 
-        canvas {
-            display: none;
+        #toastContainer {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            width: min(340px, calc(100vw - 40px));
+        }
+
+        .toast {
+            background: #172b3a;
+            color: white;
+            padding: 14px 16px;
+            border-radius: 8px;
+            box-shadow: 0 4px 14px #0003;
+            line-height: 1.5;
+            animation: appear 0.2s ease-out;
+        }
+
+        .toast strong {
+            display: block;
+            margin-bottom: 3px;
+        }
+
+        @keyframes appear {
+            from {
+                opacity: 0;
+                transform: translateY(-8px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
         }
     </style>
 </head>
 
 <body>
     <h1>Real-Time Object Detection</h1>
-    <p>Browser webcam + Python FastAPI + YOLO</p>
+    <p>Browser webcam + FastAPI + YOLO</p>
 
     <div class="panel">
         <h2>Webcam</h2>
 
-        <video id="video" autoplay playsinline muted></video>
-        <canvas id="canvas"></canvas>
-
-        <div>
-            <button id="startButton">Start Detection</button>
-            <button id="stopButton" disabled>Stop Detection</button>
+        <div class="video-container">
+            <video id="video" autoplay playsinline muted></video>
+            <canvas id="overlayCanvas"></canvas>
         </div>
+
+        <canvas id="captureCanvas"></canvas>
+
+        <button id="startButton">Start Detection</button>
+        <button id="stopButton" disabled>Stop Detection</button>
 
         <p>Status: <span id="status">Not started</span></p>
         <p class="hint">
-            The browser sends reduced-size frames to the local Python server.
+            Bounding boxes are drawn in your browser.
+            Object detection runs on the Python server.
         </p>
     </div>
 
@@ -95,16 +153,33 @@
         <ul id="detections"></ul>
     </div>
 
+    <div id="toastContainer" aria-live="polite"></div>
+
     <script>
         const video = document.getElementById("video");
-        const canvas = document.getElementById("canvas");
-        const ctx = canvas.getContext("2d");
 
-        const startButton = document.getElementById("startButton");
-        const stopButton = document.getElementById("stopButton");
-        const statusElement = document.getElementById("status");
-        const summaryElement = document.getElementById("summary");
-        const detectionsElement = document.getElementById("detections");
+        const captureCanvas =
+            document.getElementById("captureCanvas");
+        const captureContext =
+            captureCanvas.getContext("2d");
+
+        const overlayCanvas =
+            document.getElementById("overlayCanvas");
+        const overlayContext =
+            overlayCanvas.getContext("2d");
+
+        const startButton =
+            document.getElementById("startButton");
+        const stopButton =
+            document.getElementById("stopButton");
+        const statusElement =
+            document.getElementById("status");
+        const summaryElement =
+            document.getElementById("summary");
+        const detectionsElement =
+            document.getElementById("detections");
+        const toastContainer =
+            document.getElementById("toastContainer");
 
         let cameraStream = null;
         let socket = null;
@@ -112,31 +187,53 @@
         let waitingForResult = false;
         let running = false;
 
+        // Only these object classes trigger notifications.
+        const NOTIFY_OBJECTS = new Set([
+            "person",
+            "car",
+            "dog",
+            "phone"
+        ]);
+
+        // Each object class has its own notification cooldown.
+        const TOAST_COOLDOWN_MS = 3000;
+        const lastToastAt = new Map();
+
         function setStatus(message) {
             statusElement.textContent = message;
         }
 
         async function startDetection() {
-            if (running) return;
+            if (running || cameraStream) return;
 
             try {
                 setStatus("Requesting camera permission...");
 
-                cameraStream = await navigator.mediaDevices.getUserMedia({
-                    video: true,
-                    audio: false
-                });
+                cameraStream =
+                    await navigator.mediaDevices.getUserMedia({
+                        video: true,
+                        audio: false
+                    });
 
                 video.srcObject = cameraStream;
                 await video.play();
 
                 setStatus("Connecting to Python server...");
 
-                socket = new WebSocket(
-                    `ws://${window.location.host}/ws/detect`
-                );
+                const protocol =
+                    window.location.protocol === "https:"
+                        ? "wss:"
+                        : "ws:";
 
-                socket.onopen = () => {
+                const wsUrl =
+                    `${protocol}//${window.location.host}/ws/detect`;
+
+                const newSocket = new WebSocket(wsUrl);
+                socket = newSocket;
+
+                newSocket.onopen = () => {
+                    if (socket !== newSocket) return;
+
                     running = true;
                     waitingForResult = false;
 
@@ -145,37 +242,60 @@
 
                     setStatus("Connected — detecting objects...");
 
-                    // Send a new frame only after the previous
-                    // frame's result has arrived.
                     captureTimer = setInterval(sendFrame, 200);
                 };
 
-                socket.onmessage = (event) => {
+                newSocket.onmessage = (event) => {
+                    if (socket !== newSocket) return;
+
                     waitingForResult = false;
 
-                    const data = JSON.parse(event.data);
+                    try {
+                        const data = JSON.parse(event.data);
 
-                    if (data.error) {
-                        setStatus(data.error);
-                        return;
+                        if (data.error) {
+                            setStatus(data.error);
+                            return;
+                        }
+
+                        showDetections(
+                            data.detections || [],
+                            data.width,
+                            data.height
+                        );
+                    } catch (error) {
+                        console.error("Invalid server response:", error);
+                        setStatus("Could not read detection results.");
                     }
-
-                    showDetections(data.detections);
                 };
 
-                socket.onerror = () => {
-                    setStatus("WebSocket error. Check the Python server.");
+                newSocket.onerror = () => {
+                    if (socket === newSocket) {
+                        setStatus(
+                            "WebSocket error. Check the Python server."
+                        );
+                    }
                 };
 
-                socket.onclose = () => {
+                newSocket.onclose = () => {
+                    if (socket !== newSocket) return;
+
                     cleanup();
+                    socket = null;
                     setStatus("Connection closed.");
                 };
 
             } catch (error) {
-                cleanup();
-                setStatus("Error: " + error.message);
                 console.error(error);
+                cleanup();
+
+                if (socket) {
+                    const oldSocket = socket;
+                    socket = null;
+                    oldSocket.close();
+                }
+
+                setStatus("Error: " + error.message);
             }
         }
 
@@ -185,28 +305,43 @@
                 !socket ||
                 socket.readyState !== WebSocket.OPEN ||
                 waitingForResult ||
-                video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA
+                video.readyState <
+                    HTMLMediaElement.HAVE_CURRENT_DATA ||
+                !video.videoWidth ||
+                !video.videoHeight
             ) {
                 return;
             }
 
-            // Resize the frame to reduce network and inference work.
+            // Send a smaller image to reduce inference workload.
             const maxWidth = 480;
             const scale = Math.min(
                 maxWidth / video.videoWidth,
                 1
             );
 
-            canvas.width = Math.round(video.videoWidth * scale);
-            canvas.height = Math.round(video.videoHeight * scale);
+            captureCanvas.width =
+                Math.round(video.videoWidth * scale);
+            captureCanvas.height =
+                Math.round(video.videoHeight * scale);
 
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            captureContext.drawImage(
+                video,
+                0,
+                0,
+                captureCanvas.width,
+                captureCanvas.height
+            );
 
             waitingForResult = true;
 
-            canvas.toBlob((blob) => {
-                if (!blob || !running ||
-                    socket.readyState !== WebSocket.OPEN) {
+            captureCanvas.toBlob((blob) => {
+                if (
+                    !blob ||
+                    !running ||
+                    !socket ||
+                    socket.readyState !== WebSocket.OPEN
+                ) {
                     waitingForResult = false;
                     return;
                 }
@@ -215,7 +350,13 @@
             }, "image/jpeg", 0.75);
         }
 
-        function showDetections(detections) {
+        function showDetections(detections, frameWidth, frameHeight) {
+            drawBoundingBoxes(
+                detections,
+                frameWidth,
+                frameHeight
+            );
+
             detectionsElement.replaceChildren();
 
             summaryElement.textContent =
@@ -236,7 +377,130 @@
                     `${(detection.confidence * 100).toFixed(1)}% confidence`;
 
                 detectionsElement.appendChild(item);
+
+                if (NOTIFY_OBJECTS.has(detection.label)) {
+                    maybeShowToast(detection);
+                }
             }
+        }
+
+        function drawBoundingBoxes(
+            detections,
+            frameWidth,
+            frameHeight
+        ) {
+            const displayWidth = video.clientWidth;
+            const displayHeight = video.clientHeight;
+
+            if (
+                !displayWidth ||
+                !displayHeight ||
+                !frameWidth ||
+                !frameHeight
+            ) {
+                return;
+            }
+
+            // Match the overlay canvas to the displayed video size.
+            const pixelRatio = window.devicePixelRatio || 1;
+
+            overlayCanvas.width =
+                Math.round(displayWidth * pixelRatio);
+            overlayCanvas.height =
+                Math.round(displayHeight * pixelRatio);
+
+            overlayContext.setTransform(
+                pixelRatio, 0, 0, pixelRatio, 0, 0
+            );
+
+            overlayContext.clearRect(
+                0, 0, displayWidth, displayHeight
+            );
+
+            const scaleX = displayWidth / frameWidth;
+            const scaleY = displayHeight / frameHeight;
+
+            overlayContext.lineWidth = 3;
+            overlayContext.font = "bold 15px Arial";
+
+            for (const detection of detections) {
+                const [x1, y1, x2, y2] = detection.box;
+
+                const x = x1 * scaleX;
+                const y = y1 * scaleY;
+                const width = (x2 - x1) * scaleX;
+                const height = (y2 - y1) * scaleY;
+
+                const label =
+                    `${detection.label} ` +
+                    `${(detection.confidence * 100).toFixed(0)}%`;
+
+                overlayContext.strokeStyle = "#00e676";
+                overlayContext.strokeRect(
+                    x, y, width, height
+                );
+
+                const textWidth =
+                    overlayContext.measureText(label).width;
+
+                const labelHeight = 23;
+                const labelY = Math.max(0, y - labelHeight);
+
+                overlayContext.fillStyle = "#00a854";
+                overlayContext.fillRect(
+                    x,
+                    labelY,
+                    textWidth + 12,
+                    labelHeight
+                );
+
+                overlayContext.fillStyle = "#ffffff";
+                overlayContext.fillText(
+                    label,
+                    x + 6,
+                    labelY + 16
+                );
+            }
+        }
+
+        function maybeShowToast(detection) {
+            const now = Date.now();
+            const lastTime = lastToastAt.get(detection.label) || 0;
+
+            if (now - lastTime < TOAST_COOLDOWN_MS) {
+                return;
+            }
+
+            lastToastAt.set(detection.label, now);
+
+            showToast(
+                `${capitalize(detection.label)} detected`,
+                `${(detection.confidence * 100).toFixed(1)}% confidence`
+            );
+        }
+
+        function showToast(title, message) {
+            const toast = document.createElement("div");
+            toast.className = "toast";
+
+            const heading = document.createElement("strong");
+            heading.textContent = `🔔 ${title}`;
+
+            const details = document.createElement("span");
+            details.textContent = message;
+
+            toast.append(heading, details);
+            toastContainer.appendChild(toast);
+
+            while (toastContainer.children.length > 4) {
+                toastContainer.firstElementChild.remove();
+            }
+
+            setTimeout(() => toast.remove(), 3000);
+        }
+
+        function capitalize(value) {
+            return value.charAt(0).toUpperCase() + value.slice(1);
         }
 
         function cleanup() {
@@ -249,11 +513,17 @@
             }
 
             if (cameraStream) {
-                cameraStream.getTracks().forEach(track => track.stop());
+                cameraStream.getTracks().forEach(
+                    track => track.stop()
+                );
                 cameraStream = null;
             }
 
             video.srcObject = null;
+
+            overlayContext.clearRect(
+                0, 0, overlayCanvas.width, overlayCanvas.height
+            );
 
             startButton.disabled = false;
             stopButton.disabled = true;
@@ -279,6 +549,14 @@
 
         startButton.addEventListener("click", startDetection);
         stopButton.addEventListener("click", stopDetection);
+
+        window.addEventListener("resize", () => {
+            // The next detection response redraws boxes at the
+            // correct size for the resized video element.
+            overlayContext.clearRect(
+                0, 0, overlayCanvas.width, overlayCanvas.height
+            );
+        });
     </script>
 </body>
 </html>
